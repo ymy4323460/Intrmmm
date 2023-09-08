@@ -63,41 +63,39 @@ def _hparams(algorithm, dataset, random_seed):
         _hparam('irm_penalty_anneal_iters', 500,
                 lambda r: int(10**r.uniform(0, 4)))
 
+    elif algorithm == "InterRM":
+        _hparam('prior_type', 'conditional',lambda r:'conditional')
+        _hparam('int_lambda', 0.001, lambda r: r.choice([0.01, 0.001]))
+        _hparam('int_reg', 0.01, lambda r: r.choice([0.1, 0.01]))
+        _hparam('target_lambda', 0.1, lambda r: r.choice([0.1, 0.3]))
+        _hparam('kl_lambda', 0.05, lambda r: r.choice([0.1, 0.03, 0.05]))
+        _hparam('mlp_width', 128, lambda r: int(2 ** r.uniform(7)))
+        _hparam('bias', 1, lambda r: int(r.choice([1, 3, 5])))
+        _hparam('mlp_depth', 5, lambda r: int(r.choice([5])))
+        _hparam('mlp_dropout', 0., lambda r: r.choice([0.]))
+
+
     elif algorithm == "InterIRM":
         _hparam('irm_lambda', 1e2, lambda r: 10**r.uniform(-1, 5))
         _hparam('irm_penalty_anneal_iters', 500,
                 lambda r: int(10**r.uniform(0, 4)))
         _hparam('prior_type', 'conditional',lambda r:'conditional')
         _hparam('int_lambda', 0.001, lambda r: r.choice([0.01, 0.001]))
-        _hparam('int_reg', 0.1, lambda r: r.choice([0.1, 0.01]))
-        _hparam('target_lambda', 0.1, lambda r: r.choice([0.1, 0.05]))
-        _hparam('kl_lambda', 0.01, lambda r: r.choice([0.01]))
-        _hparam('mlp_width', 128, lambda r: r.choice([128, 256]))
-        _hparam('bias', 2, lambda r: int(r.choice([1, 2, 5, 10])))
-        _hparam('mlp_depth', 5, lambda r: int(r.choice([1, 3, 5])))
-        _hparam('mlp_dropout', 0., lambda r: r.choice([0.]))
-
-    elif algorithm == "InterRM":
-        _hparam('prior_type', 'conditional',lambda r:'conditional')
-        _hparam('int_lambda', 0.001, lambda r: r.choice([0.01, 0.001]))
         _hparam('int_reg', 0.01, lambda r: r.choice([0.1, 0.01]))
         _hparam('target_lambda', 0.1, lambda r: r.choice([0.1, 0.3]))
-        _hparam('kl_lambda', 0.5, lambda r: r.choice([0.1, 0.3, 0.5]))
-        _hparam('mlp_width', 128, lambda r: r.choice([128, 256]))
-        _hparam('bias', 2, lambda r: int(r.choice([1, 2, 5, 10, 15])))
-        _hparam('mlp_depth', 5, lambda r: int(r.choice([1, 3, 5])))
+        _hparam('kl_lambda', 0.05, lambda r: r.choice([0.1, 0.03, 0.05]))
+        _hparam('mlp_width', 512, lambda r: int(2 ** r.uniform(8, 9)))
+        _hparam('bias', 1, lambda r: int(r.choice([1, 3, 5])))
+        _hparam('mlp_depth', 5, lambda r: int(r.choice([5])))
         _hparam('mlp_dropout', 0., lambda r: r.choice([0.]))
 
     elif algorithm == "InterRMMMD":
         _hparam('prior_type', 'conditional',lambda r:'conditional')
         _hparam('int_lambda', 0.001, lambda r: r.choice([0.01, 0.001]))
-        _hparam('int_reg', 0.01, lambda r: r.choice([0.1, 0.01]))
+        _hparam('int_reg', 0.01, lambda r: r.choice([0.005, 0.01]))
         _hparam('target_lambda', 0.1, lambda r: r.choice([0.1, 0.3]))
-        _hparam('kl_lambda', 0.5, lambda r: r.choice([0.1, 0.3, 0.5]))
-        _hparam('mlp_width', 128, lambda r: r.choice([128, 256]))
-        _hparam('bias', 2, lambda r: int(r.choice([1, 2, 5, 10, 15])))
-        _hparam('mlp_depth', 5, lambda r: int(r.choice([1, 3, 5])))
-        _hparam('mlp_dropout', 0., lambda r: r.choice([0.]))
+        _hparam('kl_lambda', 0.005, lambda r: r.choice([0.01, 0.005, 0.001]))
+        _hparam('bias', 10, lambda r: int(r.choice([5, 10, 15])))
 
     elif algorithm == "Mixup":
         _hparam('mixup_alpha', 0.2, lambda r: 10**r.uniform(-1, -1))

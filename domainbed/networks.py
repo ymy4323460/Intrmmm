@@ -242,11 +242,9 @@ class InterRM_Model(nn.Module):
             num_domains,
             self.hparams['nonlinear_classifier'])
         self.get_z = MLP(self.featurizer.n_outputs, self.featurizer.n_outputs, self.hparams)
-        self.intervener = MLP(self.featurizer.n_outputs, self.featurizer.n_outputs, self.hparams)
-#         self.intervener = Featurizer(input_shape, self.hparams)
+        self.intervener = nn.Linear(self.featurizer.n_outputs, self.featurizer.n_outputs)
 
     def sample_gaussian(self, m, v):
-    	# reparameterization
         sample = torch.randn(m.size()).to(torch.device('cuda:0' if torch.cuda.is_available() else 'cpu'))
         z = m + (v**0.5) * sample
         return z
@@ -254,13 +252,9 @@ class InterRM_Model(nn.Module):
     def forward(self, x):
         m = self.featurizer(x)
         v = torch.zeros_like(m)
-        z_c = m #self.sample_gaussian(m, v)
-#         print(z_c.size())
-#         pred_domain = self.discriminator(z_c)
-
-        z = self.get_z(z_c)
-        intervention = self.intervener(z_c)
+        z = m
+        intervention = self.intervener(z)
         int_z = z + intervention
         y = self.classifier(z)
         int_y = self.classifier(int_z)
-        return m, v, z, int_z, y, int_y, intervention, z_c
+        return z, int_z, y, int_y, intervention
