@@ -27,7 +27,7 @@ def stage_path(data_dir, name):
 
 
 def download_and_extract(url, dst, remove=True):
-#     gdown.download(url, dst, quiet=False)
+    gdown.download(url, dst, quiet=False)
 #     print(dst)
 
     if dst.endswith(".tar.gz"):
@@ -131,7 +131,7 @@ def download_office_home(data_dir):
     full_path = stage_path(data_dir, "office_home")
 
     download_and_extract("https://drive.google.com/uc?id=1uY0pj7oFsjMxRwaD3Sxy0jgel0fsYXLC",
-                         os.path.join(data_dir, "OfficeHome.zip"))
+                         os.path.join(data_dir, "office_home.zip"))
 
     os.rename(os.path.join(data_dir, "OfficeHomeDataset_10072016"),
               full_path)
@@ -265,7 +265,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
 #     download_mnist(args.data_dir)
-    download_pacs(args.data_dir)
+#     download_pacs(args.data_dir)
 #     download_office_home(args.data_dir)
 #     download_domain_net(args.data_dir)
     download_vlcs(args.data_dir)

@@ -151,8 +151,6 @@ if __name__ == "__main__":
     parser.add_argument('--steps', type=int, default=None)
     parser.add_argument('--hparams', type=str, default=None)
     parser.add_argument('--holdout_fraction', type=float, default=0.2)
-    parser.add_argument('--uda_holdout_fraction', type=float, default=0,
-        help="For domain adaptation, % of test to use unlabeled for training.")
     parser.add_argument('--single_test_envs', action='store_true')
     parser.add_argument('--skip_confirmation', action='store_true')
     args = parser.parse_args()

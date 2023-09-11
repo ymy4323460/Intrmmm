@@ -128,7 +128,7 @@ class InterRMMMD(ERM):
     """Interventional Risk Minimization"""
 
     def __init__(self, input_shape, num_classes, num_domains, hparams):
-        super(InterRM, self).__init__(input_shape, num_classes, num_domains,
+        super(InterRMMMD, self).__init__(input_shape, num_classes, num_domains,
                                   hparams)
         self.register_buffer('update_count', torch.tensor([0]))
         self.num_domains = num_domains

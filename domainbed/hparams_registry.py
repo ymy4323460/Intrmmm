@@ -68,12 +68,11 @@ def _hparams(algorithm, dataset, random_seed):
         _hparam('int_lambda', 0.001, lambda r: r.choice([0.01, 0.001]))
         _hparam('int_reg', 0.01, lambda r: r.choice([0.1, 0.01]))
         _hparam('target_lambda', 0.1, lambda r: r.choice([0.1, 0.3]))
-        _hparam('kl_lambda', 0.05, lambda r: r.choice([0.1, 0.03, 0.05]))
-        _hparam('mlp_width', 128, lambda r: int(2 ** r.uniform(7)))
-        _hparam('bias', 1, lambda r: int(r.choice([1, 3, 5])))
-        _hparam('mlp_depth', 5, lambda r: int(r.choice([5])))
+        _hparam('kl_lambda', 0.5, lambda r: r.choice([0.1, 0.3, 0.5]))
+        _hparam('mlp_width', 2048, lambda r: int(2 ** r.uniform(11)))
+        _hparam('bias', 1, lambda r: int(r.choice([1])))
+        _hparam('mlp_depth', 3, lambda r: int(r.choice([3])))
         _hparam('mlp_dropout', 0., lambda r: r.choice([0.]))
-
 
     elif algorithm == "InterIRM":
         _hparam('irm_lambda', 1e2, lambda r: 10**r.uniform(-1, 5))
@@ -83,19 +82,22 @@ def _hparams(algorithm, dataset, random_seed):
         _hparam('int_lambda', 0.001, lambda r: r.choice([0.01, 0.001]))
         _hparam('int_reg', 0.01, lambda r: r.choice([0.1, 0.01]))
         _hparam('target_lambda', 0.1, lambda r: r.choice([0.1, 0.3]))
-        _hparam('kl_lambda', 0.05, lambda r: r.choice([0.1, 0.03, 0.05]))
-        _hparam('mlp_width', 512, lambda r: int(2 ** r.uniform(8, 9)))
-        _hparam('bias', 1, lambda r: int(r.choice([1, 3, 5])))
-        _hparam('mlp_depth', 5, lambda r: int(r.choice([5])))
+        _hparam('kl_lambda', 0.5, lambda r: r.choice([0.1, 0.3, 0.5]))
+        _hparam('mlp_width', 2048, lambda r: int(2 ** r.uniform(11)))
+        _hparam('bias', 1, lambda r: int(r.choice([1])))
+        _hparam('mlp_depth', 3, lambda r: int(r.choice([3])))
         _hparam('mlp_dropout', 0., lambda r: r.choice([0.]))
 
-    elif algorithm == "InterRMMMD":
+    elif algorithm == "InterRMMM":
         _hparam('prior_type', 'conditional',lambda r:'conditional')
         _hparam('int_lambda', 0.001, lambda r: r.choice([0.01, 0.001]))
-        _hparam('int_reg', 0.01, lambda r: r.choice([0.005, 0.01]))
+        _hparam('int_reg', 0.01, lambda r: r.choice([0.1, 0.01]))
         _hparam('target_lambda', 0.1, lambda r: r.choice([0.1, 0.3]))
-        _hparam('kl_lambda', 0.005, lambda r: r.choice([0.01, 0.005, 0.001]))
-        _hparam('bias', 10, lambda r: int(r.choice([5, 10, 15])))
+        _hparam('kl_lambda', 0.5, lambda r: r.choice([0.1, 0.3, 0.5]))
+        _hparam('mlp_width', 2048, lambda r: int(2 ** r.uniform(11)))
+        _hparam('bias', 1, lambda r: int(r.choice([1])))
+        _hparam('mlp_depth', 3, lambda r: int(r.choice([3])))
+        _hparam('mlp_dropout', 0., lambda r: r.choice([0.]))
 
     elif algorithm == "Mixup":
         _hparam('mixup_alpha', 0.2, lambda r: 10**r.uniform(-1, -1))
@@ -164,9 +166,9 @@ def _hparams(algorithm, dataset, random_seed):
     # below corresponds to exactly one hparam. Avoid nested conditionals.
 
     if dataset in SMALL_IMAGES:
-        _hparam('lr', 1e-3, lambda r: 1e-3)
+        _hparam('lr', 1e-3, lambda r: 10**r.uniform(-4.5, -2.5))
     else:
-        _hparam('lr', 5e-5, lambda r: 5e-5)
+        _hparam('lr', 5e-5, lambda r: 10**r.uniform(-5, -3.5))
 
     if dataset in SMALL_IMAGES:
         _hparam('weight_decay', 0., lambda r: 0.)

@@ -49,9 +49,11 @@ ALGORITHMS = [
     'CAD',
     'CondCAD',
     'InterRM',
-    'InterRMMMD',
     'InterIRM',
+    'InterRMMMD',
+
 ]
+
 
 
 def get_algorithm_class(algorithm_name):
@@ -124,6 +126,145 @@ class ERM(Algorithm):
 
     def predict(self, x):
         return self.network(x)
+
+
+class InterIRM(ERM):
+    """Interventional Risk Minimization"""
+
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(InterIRM, self).__init__(input_shape, num_classes, num_domains,
+                                  hparams)
+        self.register_buffer('update_count', torch.tensor([0]))
+        self.num_domains = num_domains
+        self.num_classes = num_classes
+        self.network = networks.InterRM_Model(input_shape, num_classes, self.hparams, self.num_domains)
+        for i in self.network.parameters():
+            i.requires_grad = False
+        for i in self.network.intervener.parameters():
+            i.requires_grad = True
+        # define optimizer for max
+        self.max_optimizer = torch.optim.Adam(
+                filter(lambda p: p.requires_grad, self.network.parameters()),
+                lr=self.hparams["lr"]*0.1,
+                weight_decay=self.hparams['weight_decay'])
+        for i in self.network.parameters():
+            i.requires_grad = True
+        for i in self.network.intervener.parameters():
+            i.requires_grad = True
+        # define optimizer for min
+        self.min_optimizer = torch.optim.Adam(
+                filter(lambda p: p.requires_grad, self.network.parameters()),
+                lr=self.hparams["lr"],
+                weight_decay=self.hparams['weight_decay'])
+
+        for i in self.network.parameters():
+            i.requires_grad = True
+
+        self.mse = torch.nn.MSELoss()
+        self.sftcross = torch.nn.CrossEntropyLoss()
+
+    def kl_normal(self, qm, qv, pm, pv):
+        """
+        Computes the elem-wise KL divergence between two normal distributions KL(q || p) and
+        sum over the last dimension
+
+        Args:
+            qm: tensor: (batch, dim): q mean
+            qv: tensor: (batch, dim): q variance
+            pm: tensor: (batch, dim): p mean
+            pv: tensor: (batch, dim): p variance
+
+        Return:
+            kl: tensor: (batch,): kl between each sample
+        """
+        element_wise = (qm - pm).pow(2)#0.5 * (torch.log(pv) - torch.log(qv) + qv / pv + (qm - pm).pow(2) / pv - 1)
+        kl = element_wise.mean()
+        #print("log var1", qv)
+        return kl
+
+
+    @staticmethod
+    def _irm_penalty(logits, y):
+        device = "cuda" if logits[0][0].is_cuda else "cpu"
+        scale = torch.tensor(1.).to(device).requires_grad_()
+        loss_1 = F.cross_entropy(logits[::2] * scale, y[::2])
+        loss_2 = F.cross_entropy(logits[1::2] * scale, y[1::2])
+        grad_1 = autograd.grad(loss_1, [scale], create_graph=True)[0]
+        grad_2 = autograd.grad(loss_2, [scale], create_graph=True)[0]
+        result = torch.sum(grad_1 * grad_2)
+        return result
+
+    def condition_prior(self, scale, label, dim):
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        mean = ((label-scale[0])/(scale[1]-scale[0])).reshape(-1, 1).repeat(1, dim) #torch.ones(label.size()[0], dim)*label
+        var = torch.ones(label.size()[0], dim)
+        return mean.to(device), var.to(device)
+
+    def intervention_loss(self, intervention):
+        return torch.norm(torch.pow(intervention, 2)-self.hparams['bias'])
+
+    def targets_loss(self, y_pred, int_y_pred):
+        return -self.mse(F.sigmoid(y_pred), F.sigmoid(int_y_pred))
+
+    def kl_loss(self, m, v, y):
+        if self.hparams['prior_type'] == 'conditional':
+            pm, pv = self.condition_prior([0, self.num_classes], y, m.size()[1])
+        else:
+            pm, pv = torch.zeros_like(m), torch.ones_like(m)
+        return self.kl_normal(m, pv * 0.0001, pm, pv * 0.0001)
+
+    def all_loss(self, x, y, env_i, turn='min'):
+        m, v, z, int_z, y_pred, int_y_pred, intervention, z_c = self.network(x)
+        nll = F.cross_entropy(y_pred, y).mean()
+        int_nll = -F.cross_entropy(int_y_pred, y).mean()
+        kl = self.kl_loss(z, v, y).mean() + self.kl_loss(z_c, v, y).mean()
+        inter_norm = self.intervention_loss(intervention).mean()
+        targets_loss = self.targets_loss(y_pred, int_y_pred).mean()
+
+        all = nll + self.hparams['int_lambda']*int_nll + self.hparams['int_reg']*inter_norm + self.hparams['target_lambda']*targets_loss
+        if turn == 'min':
+            return all + self.hparams['kl_lambda']*kl, self._irm_penalty(y_pred, y)
+        else:
+            return -all + self.hparams['kl_lambda']*kl
+
+
+    def update(self, minibatches, unlabeled=None):
+        device = "cuda" if minibatches[0][0].is_cuda else "cpu"
+        penalty_weight = (self.hparams['irm_lambda'] if self.update_count
+                          >= self.hparams['irm_penalty_anneal_iters'] else
+                          1.0)
+        nll = 0.
+        penalty = 0.
+        for i in self.network.parameters():
+            i.requires_grad = True
+
+        self.min_optimizer = torch.optim.Adam(
+                filter(lambda p: p.requires_grad, self.network.parameters()),
+                lr=self.hparams["lr"],
+                weight_decay=self.hparams['weight_decay'])
+
+        for i, (x, y, env_i) in enumerate(minibatches):
+
+            self.min_optimizer.zero_grad()
+            loss, penalty = self.all_loss(x, y, env_i, 'min')
+            L = loss.mean() + penalty_weight/x.size()[0] * penalty
+            L.backward()
+            self.min_optimizer.step()
+
+#             self.max_optimizer.zero_grad()
+#             loss = self.all_loss(x, y, 'max')
+#             L = loss.mean()
+#             L.backward()
+#             self.max_optimizer.step()
+
+        self.update_count += 1
+
+        return {'loss': L.cpu().detach().numpy().item(), 'nll': L.cpu().detach().numpy().item(),
+            'penalty': L.cpu().detach().numpy().item()}
+
+    def predict(self, x):
+        return self.network(x)[4]
+
 
 class InterRMMMD(ERM):
     """Interventional Risk Minimization"""
@@ -276,24 +417,20 @@ class InterRMMMD(ERM):
         batch_num = len(minibatches)
 
         forward_results = [self.network(x) for x, _, _ in minibatches] #m, v, z, int_z, y_pred, int_y_pred, intervention, z_c
-        if unlabeled:
-            unlabled_forward_results = [self.network(x) for x, _ in unlabeled]
         targets = [yi for _, yi, _ in minibatches]
 #         v, z, y_pred, int_y_pred, intervention, z_c = forward_results[:, 1], forward_results[:][2], forward_results[:][4], forward_results[:][5], forward_results[:][6], forward_results[:][7]
-#         print(minibatches[0][0][0].size(), unlabeled[0][0].size())
+
         for i in range(batch_num):
             objective += self.all_loss(forward_results[i][1], forward_results[i][2], forward_results[i][4], forward_results[i][5], forward_results[i][6], forward_results[i][7], targets[i]).mean()#v, z, y_pred, int_y_pred, intervention, z_c
-#             for j in range(i+1, batch_num):
-            if unlabeled:
-                mmd_penalty += self.mmd(forward_results[i][7], unlabled_forward_results[0][7])
-            else: break
+            for j in range(i+1, batch_num):
+                mmd_penalty += self.mmd(forward_results[i][7], forward_results[j][7])
 
         objective /= batch_num
         if batch_num > 1:
             mmd_penalty /= (batch_num * (batch_num - 1) / 2)
 
         self.min_optimizer.zero_grad()
-        (objective + (self.hparams['int_lambda']*0.1 * mmd_penalty)).backward()
+        (objective + (self.hparams['int_lambda'] * mmd_penalty)).backward()
         self.min_optimizer.step()
 
 #         self.min_optimizer.zero_grad()
@@ -326,6 +463,8 @@ class InterRMMMD(ERM):
     def predict(self, x):
         return self.network(x)[4]
 
+
+
 class InterRM(ERM):
     """Interventional Risk Minimization"""
 
@@ -337,14 +476,14 @@ class InterRM(ERM):
         self.num_classes = num_classes
         self.network = networks.InterRM_Model(input_shape, num_classes, self.hparams, self.num_domains)
         for i in self.network.parameters():
-            i.requires_grad = True
-        for i in self.network.intervener.parameters():
             i.requires_grad = False
+        for i in self.network.intervener.parameters():
+            i.requires_grad = True
         # define optimizer for max
         self.max_optimizer = torch.optim.Adam(
                 filter(lambda p: p.requires_grad, self.network.parameters()),
-                lr=self.hparams["lr"],
-                weight_decay=self.hparams['weight_decay']*0.1)
+                lr=self.hparams["lr"]*0.1,
+                weight_decay=self.hparams['weight_decay'])
         for i in self.network.parameters():
             i.requires_grad = True
         for i in self.network.intervener.parameters():
@@ -375,145 +514,88 @@ class InterRM(ERM):
         Return:
             kl: tensor: (batch,): kl between each sample
         """
-        element_wise = 0.5 * (torch.log(pv) - torch.log(qv) + qv / pv + (qm - pm).pow(2) / pv - 1)
+        element_wise = (qm - pm).pow(2)#0.5 * (torch.log(pv) - torch.log(qv) + qv / pv + (qm - pm).pow(2) / pv - 1)
         kl = element_wise.mean()
+        #print("log var1", qv)
         return kl
 
     def condition_prior(self, scale, label, dim):
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        mean = ((label-scale[0])/(scale[1])).reshape(-1, 1).repeat(1, dim) #torch.ones(label.size()[0], dim)*label
+        mean = ((label-scale[0])/(scale[1]-scale[0])).reshape(-1, 1).repeat(1, dim) #torch.ones(label.size()[0], dim)*label
         var = torch.ones(label.size()[0], dim)
+        # print(label)
+#         for i in range(label.size()[0]):
+#             # print(label[i])
+#             mul = (float(label[i])-scale[0])/(scale[1]-0)
+#             mean[i] = torch.ones(dim)*mul
+#             var[i] = torch.ones(dim)*1
         return mean.to(device), var.to(device)
 
     def intervention_loss(self, intervention):
-#         print(torch.pow(intervention, 2).mean())
         return torch.norm(torch.pow(intervention, 2)-self.hparams['bias'])
 
     def targets_loss(self, y_pred, int_y_pred):
-        y1 = torch.argmax(y_pred, axis=1).clone().detach()
-        y2 = torch.argmax(int_y_pred, axis=1).clone().detach()
-        return -self.mse(F.sigmoid(y_pred), F.sigmoid(int_y_pred))#-F.cross_entropy(y_pred, y2).mean() - F.cross_entropy(int_y_pred, y1).mean()
-
+        return -self.mse(F.sigmoid(y_pred), F.sigmoid(int_y_pred))
 
     def kl_loss(self, m, v, y):
         if self.hparams['prior_type'] == 'conditional':
-            pm, pv = self.condition_prior([0, 1], y, m.size()[1])[0], torch.ones_like(m)
+            pm, pv = self.condition_prior([0, self.num_classes], y, m.size()[1])
         else:
             pm, pv = torch.zeros_like(m), torch.ones_like(m)
-        return self.kl_normal(m, pv, pm, pv)
+        # print(m)
+        return self.kl_normal(m, pv * 0.0001, pm, pv * 0.0001)
 
     def all_loss(self, x, y, env_i, turn='min'):
-        z, int_z, y_pred, int_y_pred, intervention = self.network(x)
+        m, v, z, int_z, y_pred, int_y_pred, intervention, z_c = self.network(x)
+#         print(z_c.size())
         nll = F.cross_entropy(y_pred, y).mean()
         int_nll = -F.cross_entropy(int_y_pred, y).mean()
-        v = torch.ones_like(z)
-        y_1 = y.clone().detach().float()
-#         print(y_1, y)
-        kl = self.kl_loss(z, v, y).mean()#-self.kl_loss(int_z, v, y).mean()
+        kl = self.kl_loss(z, v, y).mean() + self.kl_loss(z_c, v, y).mean()
         inter_norm = self.intervention_loss(intervention).mean()
         targets_loss = self.targets_loss(y_pred, int_y_pred).mean()
 
+        all = nll + self.hparams['int_lambda']*int_nll + self.hparams['int_reg']*inter_norm + self.hparams['target_lambda']*targets_loss
         if turn == 'min':
-            return nll,  int_nll, inter_norm, targets_loss, kl
+            return all + self.hparams['kl_lambda']*kl
         else:
-            return nll,  int_nll, inter_norm, targets_loss, kl#-(self.hparams['int_lambda']*int_nll) + self.hparams['kl_lambda']*kl
+            return -all - self.hparams['kl_lambda']*kl
 
-    def adapt_loss(self, x, env_i):
-        m, v, z, int_z, y_pred, int_y_pred, intervention, z_c = self.network(x)
-        targets_loss = self.targets_loss(y_pred, int_y_pred).mean()
-        return targets_loss
 
     def update(self, minibatches, unlabeled=None):
         device = "cuda" if minibatches[0][0].is_cuda else "cpu"
+#         penalty_weight = (self.hparams['irm_lambda'] if self.update_count
+#                           >= self.hparams['irm_penalty_anneal_iters'] else
+#                           1.0)
         nll = 0.
         penalty = 0.
 
         for i, (x, y, env_i) in enumerate(minibatches):
-            if i%100 ==0 and i>0:
-                self.max_optimizer.zero_grad()
-                nll_max,  int_nll_max, _, _, kl_max = self.all_loss(x, y, env_i, 'max')
-                loss_max = -(nll_max + self.hparams['int_lambda']*int_nll_max) + self.hparams['kl_lambda']*kl_max
-                L = loss_max.mean()
-                L.backward()
-                self.max_optimizer.step()
 
             self.min_optimizer.zero_grad()
-            nll,  int_nll, inter_norm, targets_loss, kl = self.all_loss(x, y, env_i, 'min')
-            loss = nll +  self.hparams['int_reg']*inter_norm + self.hparams['target_lambda']*targets_loss + self.hparams['kl_lambda']*kl
-
+            loss = self.all_loss(x, y, env_i, 'min')
             L = loss.mean()
             L.backward()
             self.min_optimizer.step()
+
+#             self.max_optimizer.zero_grad()
+#             loss = self.all_loss(x, y, 'max')
+#             L = loss.mean()
+#             L.backward()
+#             self.max_optimizer.step()
+
         self.update_count += 1
 
-
-
-        return {'loss': loss.cpu().detach().numpy().item(), 'nll': nll.cpu().detach().numpy().item(),
-            'inter_norm': inter_norm.cpu().detach().numpy().item(),
-            'monotonicity': targets_loss.cpu().detach().numpy().item(),
-            'kl': kl.cpu().detach().numpy().item()
-            }
+        return {'loss': L.cpu().detach().numpy().item(), 'nll': L.cpu().detach().numpy().item(),
+            'penalty': L.cpu().detach().numpy().item()}
 
     def predict(self, x):
-        return self.network(x)[2]
+        return self.network(x)[4]
 
-
-
-# class InterRM(ERM):
-#     """Inter Risk Minimization"""
-
-#     def __init__(self, input_shape, num_classes, num_domains, hparams):
-#         super(InterRM, self).__init__(input_shape, num_classes, num_domains,
-#                                       hparams)
-#         self.featurizer = networks.Featurizer(input_shape, self.hparams)
-#         self.classifier = networks.Classifier(
-#             self.featurizer.n_outputs,
-#             num_classes,
-#             self.hparams['nonlinear_classifier'])
-
-#         self.model = nn.Sequential(self.featurizer, self.classifier)
-
-#         # max_optimizer
-#         for i in self.model.parameters():
-#             i.requires_grad = False
-#         for i in self.model.intervention.parameters():
-#             i.requires_grad = True
-#         self.max_optimizer = torch.optim.Adam(
-#             filter(lambda p: p.requires_grad, self.model.parameters()),
-#             lr=self.hparams["lr"],
-#             weight_decay=self.hparams['weight_decay']
-#         )
-#         # min_optimizer
-#         for i in self.model.parameters():
-#             i.requires_grad = True
-#         for i in self.model.intervention.parameters():
-#             i.requires_grad = False
-#         self.min_optimizer = torch.optim.Adam(
-#             filter(lambda p: p.requires_grad, self.model.parameters()),
-#             lr=self.hparams["lr"],
-#             weight_decay=self.hparams['weight_decay'])
-
-#     def update(self, minibatches, unlabeled=None):
-#         all_x = torch.cat([x for x, y in minibatches])
-#         all_y = torch.cat([y for x, y in minibatches])
-#         loss = F.cross_entropy(self.predict(all_x), all_y)
-
-
-
-
-#         self.optimizer.zero_grad()
-#         loss.backward()
-#         self.optimizer.step()
-
-#         return {'loss': loss.item()}
-
-#     def predict(self, x):
-#         return self.network(x)
 
 
 class Fish(Algorithm):
     """
-    Implementation of Fish, as seen in Gradient Matching for Domain
+    Implementation of Fish, as seen in Gradient Matching for Domain 
     Generalization, Shi et al. 2021.
     """
 
@@ -596,105 +678,6 @@ class ARM(ERM):
         x = torch.cat([x, context], dim=1)
         return self.network(x)
 
-#
-# class AbstractDANN(Algorithm):
-#     """Domain-Adversarial Neural Networks (abstract class)"""
-#
-#     def __init__(self, input_shape, num_classes, num_domains,
-#                  hparams, conditional, class_balance):
-#
-#         super(AbstractDANN, self).__init__(input_shape, num_classes, num_domains,
-#                                            hparams)
-#
-#         self.register_buffer('update_count', torch.tensor([0]))
-#         self.conditional = conditional
-#         self.class_balance = class_balance
-#
-#         # Algorithms
-#         self.featurizer = networks.Featurizer(input_shape, self.hparams)
-#         self.classifier = networks.Classifier(
-#             self.featurizer.n_outputs,
-#             num_classes,
-#             self.hparams['nonlinear_classifier'])
-#         self.discriminator = networks.MLP(self.featurizer.n_outputs,
-#                                           num_domains+1, self.hparams)
-#         self.discriminator_d = networks.MLP(self.featurizer.n_outputs,
-#                                           num_domains, self.hparams)
-#         self.class_embeddings = nn.Embedding(num_classes,
-#                                              self.featurizer.n_outputs)
-#
-#         # Optimizers
-#         self.disc_opt = torch.optim.Adam(
-#             (list(self.discriminator.parameters()) +
-#              list(self.class_embeddings.parameters())),
-#             lr=self.hparams["lr_d"],
-#             weight_decay=self.hparams['weight_decay_d'],
-#             betas=(self.hparams['beta1'], 0.9))
-#
-#         self.gen_opt = torch.optim.Adam(
-#             (list(self.featurizer.parameters()) +
-#              list(self.classifier.parameters())),
-#             lr=self.hparams["lr_g"],
-#             weight_decay=self.hparams['weight_decay_g'],
-#             betas=(self.hparams['beta1'], 0.9))
-#
-#     def update(self, minibatches, unlabeled=None):
-#         device = "cuda" if minibatches[0][0].is_cuda else "cpu"
-#         self.update_count += 1
-#         all_x = torch.cat([x for x, y, _ in minibatches])
-#         all_y = torch.cat([y for x, y, _ in minibatches])
-#         all_z = self.featurizer(all_x)
-#
-#         if unlabeled:
-#             all_env = torch.cat([e for x, y, e in minibatches]+[e for x, e in unlabeled])
-#             all_x_with_unlable = torch.cat([x for x, y, _ in minibatches]+[x for x, _ in unlabeled])
-#             all_z_with_unlable = self.featurizer(all_x_with_unlable)
-#         if self.conditional:
-#             disc_input = all_z_with_unlable + self.class_embeddings(all_y)
-#         else:
-#             disc_input = all_z_with_unlable
-# #         print(all_env)
-#         disc_out = self.discriminator(disc_input)
-#         disc_labels = torch.cat([
-#             torch.full((x.shape[0],), i, dtype=torch.int64, device=device)
-#             for i, (x, y, _) in enumerate(minibatches)
-#         ])
-# #         print(disc_labels)
-#         if self.class_balance:
-#             y_counts = F.one_hot(all_y).sum(dim=0)
-#             weights = 1. / (y_counts[all_y] * y_counts.shape[0]).float()
-#             disc_loss = F.cross_entropy(disc_out, all_env, reduction='none')
-#             disc_loss = (weights * disc_loss).sum()
-#         else:
-#             disc_loss = F.cross_entropy(disc_out, all_env)
-#
-#         disc_softmax = F.softmax(disc_out, dim=1)
-#         input_grad = autograd.grad(disc_softmax[:, all_env].sum(),
-#                                    [disc_input], create_graph=True)[0]
-#         grad_penalty = (input_grad ** 2).sum(dim=1).mean(dim=0)
-#         disc_loss += self.hparams['grad_penalty'] * grad_penalty
-#
-#         d_steps_per_g = self.hparams['d_steps_per_g_step']
-#         if (self.update_count.item() % (1 + d_steps_per_g) < d_steps_per_g):
-#
-#             self.disc_opt.zero_grad()
-#             disc_loss.backward()
-#             self.disc_opt.step()
-#             return {'disc_loss': disc_loss.item()}
-#         else:
-#             all_preds = self.classifier(all_z)
-#             classifier_loss = F.cross_entropy(all_preds, all_y)
-#             gen_loss = (classifier_loss +
-#                         (self.hparams['lambda'] * -disc_loss))
-#             self.disc_opt.zero_grad()
-#             self.gen_opt.zero_grad()
-#             gen_loss.backward()
-#             self.gen_opt.step()
-#             return {'gen_loss': gen_loss.item()}
-#
-#     def predict(self, x):
-#         return self.classifier(self.featurizer(x))
-
 
 class AbstractDANN(Algorithm):
     """Domain-Adversarial Neural Networks (abstract class)"""
@@ -703,7 +686,7 @@ class AbstractDANN(Algorithm):
                  hparams, conditional, class_balance):
 
         super(AbstractDANN, self).__init__(input_shape, num_classes, num_domains,
-                                  hparams)
+                                           hparams)
 
         self.register_buffer('update_count', torch.tensor([0]))
         self.conditional = conditional
@@ -716,21 +699,21 @@ class AbstractDANN(Algorithm):
             num_classes,
             self.hparams['nonlinear_classifier'])
         self.discriminator = networks.MLP(self.featurizer.n_outputs,
-            num_domains, self.hparams)
+                                          num_domains, self.hparams)
         self.class_embeddings = nn.Embedding(num_classes,
-            self.featurizer.n_outputs)
+                                             self.featurizer.n_outputs)
 
         # Optimizers
         self.disc_opt = torch.optim.Adam(
             (list(self.discriminator.parameters()) +
-                list(self.class_embeddings.parameters())),
+             list(self.class_embeddings.parameters())),
             lr=self.hparams["lr_d"],
             weight_decay=self.hparams['weight_decay_d'],
             betas=(self.hparams['beta1'], 0.9))
 
         self.gen_opt = torch.optim.Adam(
             (list(self.featurizer.parameters()) +
-                list(self.classifier.parameters())),
+             list(self.classifier.parameters())),
             lr=self.hparams["lr_g"],
             weight_decay=self.hparams['weight_decay_g'],
             betas=(self.hparams['beta1'], 0.9))
@@ -738,8 +721,8 @@ class AbstractDANN(Algorithm):
     def update(self, minibatches, unlabeled=None):
         device = "cuda" if minibatches[0][0].is_cuda else "cpu"
         self.update_count += 1
-        all_x = torch.cat([x for x, y, _ in minibatches])
-        all_y = torch.cat([y for x, y, _ in minibatches])
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
         all_z = self.featurizer(all_x)
         if self.conditional:
             disc_input = all_z + self.class_embeddings(all_y)
@@ -747,8 +730,8 @@ class AbstractDANN(Algorithm):
             disc_input = all_z
         disc_out = self.discriminator(disc_input)
         disc_labels = torch.cat([
-            torch.full((x.shape[0], ), i, dtype=torch.int64, device=device)
-            for i, (x, y, _) in enumerate(minibatches)
+            torch.full((x.shape[0],), i, dtype=torch.int64, device=device)
+            for i, (x, y) in enumerate(minibatches)
         ])
 
         if self.class_balance:
@@ -759,14 +742,14 @@ class AbstractDANN(Algorithm):
         else:
             disc_loss = F.cross_entropy(disc_out, disc_labels)
 
-        input_grad = autograd.grad(
-            F.cross_entropy(disc_out, disc_labels, reduction='sum'),
-            [disc_input], create_graph=True)[0]
-        grad_penalty = (input_grad**2).sum(dim=1).mean(dim=0)
+        disc_softmax = F.softmax(disc_out, dim=1)
+        input_grad = autograd.grad(disc_softmax[:, disc_labels].sum(),
+                                   [disc_input], create_graph=True)[0]
+        grad_penalty = (input_grad ** 2).sum(dim=1).mean(dim=0)
         disc_loss += self.hparams['grad_penalty'] * grad_penalty
 
         d_steps_per_g = self.hparams['d_steps_per_g_step']
-        if (self.update_count.item() % (1+d_steps_per_g) < d_steps_per_g):
+        if (self.update_count.item() % (1 + d_steps_per_g) < d_steps_per_g):
 
             self.disc_opt.zero_grad()
             disc_loss.backward()
@@ -785,6 +768,7 @@ class AbstractDANN(Algorithm):
 
     def predict(self, x):
         return self.classifier(self.featurizer(x))
+
 
 class DANN(AbstractDANN):
     """Unconditional DANN"""
@@ -857,146 +841,6 @@ class IRM(ERM):
         self.update_count += 1
         return {'loss': loss.item(), 'nll': nll.item(),
                 'penalty': penalty.item()}
-
-class InterIRM(IRM):
-    """Interventional Risk Minimization"""
-
-    def __init__(self, input_shape, num_classes, num_domains, hparams):
-        super(InterIRM, self).__init__(input_shape, num_classes, num_domains,
-                                  hparams)
-        self.register_buffer('update_count', torch.tensor([0]))
-        self.num_domains = num_domains
-        self.num_classes = num_classes
-        self.network = networks.InterRM_Model(input_shape, num_classes, self.hparams, self.num_domains)
-        self.update_count = self.register_buffer('update_count', torch.tensor([0]))
-        self.update_ct = 0
-        for i in self.network.parameters():
-            i.requires_grad = True
-        for i in self.network.intervener.parameters():
-            i.requires_grad = False
-        # define optimizer for max
-        self.max_optimizer = torch.optim.Adam(
-                filter(lambda p: p.requires_grad, self.network.parameters()),
-                lr=self.hparams["lr"],
-                weight_decay=self.hparams['weight_decay']*0.1)
-        for i in self.network.parameters():
-            i.requires_grad = True
-        for i in self.network.intervener.parameters():
-            i.requires_grad = True
-        # define optimizer for min
-        self.min_optimizer = torch.optim.Adam(
-                filter(lambda p: p.requires_grad, self.network.parameters()),
-                lr=self.hparams["lr"],
-                weight_decay=self.hparams['weight_decay'])
-
-        for i in self.network.parameters():
-            i.requires_grad = True
-
-        self.mse = torch.nn.MSELoss()
-        self.sftcross = torch.nn.CrossEntropyLoss()
-
-    def kl_normal(self, qm, qv, pm, pv):
-        """
-        Computes the elem-wise KL divergence between two normal distributions KL(q || p) and
-        sum over the last dimension
-
-        Args:
-            qm: tensor: (batch, dim): q mean
-            qv: tensor: (batch, dim): q variance
-            pm: tensor: (batch, dim): p mean
-            pv: tensor: (batch, dim): p variance
-
-        Return:
-            kl: tensor: (batch,): kl between each sample
-        """
-        element_wise = 0.5 * (torch.log(pv) - torch.log(qv) + qv / pv + (qm - pm).pow(2) / pv - 1)
-        kl = element_wise.mean()
-        return kl
-
-    def condition_prior(self, scale, label, dim):
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        mean = ((label-scale[0])/(scale[1])).reshape(-1, 1).repeat(1, dim) #torch.ones(label.size()[0], dim)*label
-        var = torch.ones(label.size()[0], dim)
-        return mean.to(device), var.to(device)
-
-    def intervention_loss(self, intervention):
-#         print(torch.pow(intervention, 2).mean())
-        return torch.norm(torch.pow(intervention, 2)-self.hparams['bias'])
-
-    def targets_loss(self, y_pred, int_y_pred):
-        y1 = torch.argmax(y_pred, axis=1).clone().detach()
-        y2 = torch.argmax(int_y_pred, axis=1).clone().detach()
-        return -self.mse(F.sigmoid(y_pred), F.sigmoid(int_y_pred))#-F.cross_entropy(y_pred, y2).mean() - F.cross_entropy(int_y_pred, y1).mean()
-
-
-    def kl_loss(self, m, v, y):
-        if self.hparams['prior_type'] == 'conditional':
-            pm, pv = self.condition_prior([0, 1], y, m.size()[1])[0], torch.ones_like(m)
-        else:
-            pm, pv = torch.zeros_like(m), torch.ones_like(m)
-        return self.kl_normal(m, pv, pm, pv)
-
-    def all_loss(self, x, y, env_i, turn='min'):
-        z, int_z, y_pred, int_y_pred, intervention = self.network(x)
-        nll = F.cross_entropy(y_pred, y).mean()
-        int_nll = -F.cross_entropy(int_y_pred, y).mean()
-        v = torch.ones_like(z)
-        y_1 = y.clone().detach().float()
-#         print(y_1, y)
-        kl = self.kl_loss(z, v, y).mean()#-self.kl_loss(int_z, v, y).mean()
-        inter_norm = self.intervention_loss(intervention).mean()
-        targets_loss = self.targets_loss(y_pred, int_y_pred).mean()
-
-        if turn == 'min':
-            return nll,  int_nll, inter_norm, targets_loss, kl, self._irm_penalty(y_pred, y)
-        else:
-            return nll,  int_nll, inter_norm, targets_loss, kl#-(self.hparams['int_lambda']*int_nll) + self.hparams['kl_lambda']*kl
-
-    def adapt_loss(self, x, env_i):
-        m, v, z, int_z, y_pred, int_y_pred, intervention, z_c = self.network(x)
-        targets_loss = self.targets_loss(y_pred, int_y_pred).mean()
-        return targets_loss
-
-    def update(self, minibatches, unlabeled=None):
-        device = "cuda" if minibatches[0][0].is_cuda else "cpu"
-        penalty_weight = (self.hparams['irm_lambda'] if self.update_ct >= self.hparams['irm_penalty_anneal_iters'] else 1.0)
-        nll = 0.
-        penalty = 0.
-#             print(y)
-
-        for i, (x, y, env_i) in enumerate(minibatches):
-#             if i%100 ==0 and i>0:
-#                 self.max_optimizer.zero_grad()
-#                 nll_max,  int_nll_max, _, _, kl_max = self.all_loss(x, y, env_i, 'max')
-#                 loss_max = -(nll_max + self.hparams['int_lambda']*int_nll_max) + self.hparams['kl_lambda']*kl_max
-#                 L = loss_max.mean()
-#                 L.backward()
-#                 self.max_optimizer.step()
-
-            self.min_optimizer.zero_grad()
-            nll,  int_nll, inter_norm, targets_loss, kl, irm_penalty = self.all_loss(x, y, env_i, 'min')
-            loss = nll +  self.hparams['int_reg']*inter_norm + self.hparams['target_lambda']*targets_loss + self.hparams['kl_lambda']*kl + penalty_weight*irm_penalty
-
-            L = loss.mean()
-            L.backward()
-            self.min_optimizer.step()
-        self.update_ct += 1
-
-
-
-        return {'loss': loss.cpu().detach().numpy().item(), 'nll': nll.cpu().detach().numpy().item(),
-            'inter_norm': inter_norm.cpu().detach().numpy().item(),
-            'monotonicity': targets_loss.cpu().detach().numpy().item(),
-            'kl': kl.cpu().detach().numpy().item()
-            }
-
-    def predict(self, x):
-        return self.network(x)[2]
-
-
-
-
-
 
 
 class VREx(ERM):
@@ -1229,96 +1073,16 @@ class MLDG(ERM):
     #
     #     return objective
 
-#
-# class AbstractMMD(ERM):
-#     """
-#     Perform ERM while matching the pair-wise domain feature distributions
-#     using MMD (abstract class)
-#     """
-#
-#     def __init__(self, input_shape, num_classes, num_domains, hparams, gaussian):
-#         super(AbstractMMD, self).__init__(input_shape, num_classes, num_domains,
-#                                           hparams)
-#         if gaussian:
-#             self.kernel_type = "gaussian"
-#         else:
-#             self.kernel_type = "mean_cov"
-#
-#     def my_cdist(self, x1, x2):
-#         x1_norm = x1.pow(2).sum(dim=-1, keepdim=True)
-#         x2_norm = x2.pow(2).sum(dim=-1, keepdim=True)
-#         res = torch.addmm(x2_norm.transpose(-2, -1),
-#                           x1,
-#                           x2.transpose(-2, -1), alpha=-2).add_(x1_norm)
-#         return res.clamp_min_(1e-30)
-#
-#     def gaussian_kernel(self, x, y, gamma=[0.001, 0.01, 0.1, 1, 10, 100,
-#                                            1000]):
-#         D = self.my_cdist(x, y)
-#         K = torch.zeros_like(D)
-#
-#         for g in gamma:
-#             K.add_(torch.exp(D.mul(-g)))
-#
-#         return K
-#
-#     def mmd(self, x, y):
-#         if self.kernel_type == "gaussian":
-#             Kxx = self.gaussian_kernel(x, x).mean()
-#             Kyy = self.gaussian_kernel(y, y).mean()
-#             Kxy = self.gaussian_kernel(x, y).mean()
-#             return Kxx + Kyy - 2 * Kxy
-#         else:
-#             mean_x = x.mean(0, keepdim=True)
-#             mean_y = y.mean(0, keepdim=True)
-#             cent_x = x - mean_x
-#             cent_y = y - mean_y
-#             cova_x = (cent_x.t() @ cent_x) / (len(x) - 1)
-#             cova_y = (cent_y.t() @ cent_y) / (len(y) - 1)
-#
-#             mean_diff = (mean_x - mean_y).pow(2).mean()
-#             cova_diff = (cova_x - cova_y).pow(2).mean()
-#
-#             return mean_diff + cova_diff
-#
-#     def update(self, minibatches, unlabeled=None):
-#         objective = 0
-#         penalty = 0
-#         nmb = len(minibatches)
-#
-#         features = [self.featurizer(xi) for xi, _, _ in minibatches]
-#
-#         classifs = [self.classifier(fi) for fi in features]
-#         feature_unlable = [self.featurizer(xi) for xi, _ in unlabeled]
-#         targets = [yi for _, yi, _ in minibatches]
-#
-#         for i in range(nmb):
-#             objective += F.cross_entropy(classifs[i], targets[i])
-#             for j in range(i + 1, nmb):
-#                 penalty += self.mmd(features[i], features[j])
-#             penalty += self.mmd(features[i], feature_unlable[0])
-#
-#         objective /= nmb
-#         if nmb > 1:
-#             penalty /= (nmb * (nmb - 1) / 2)
-#
-#         self.optimizer.zero_grad()
-#         (objective + (self.hparams['mmd_gamma'] * penalty)).backward()
-#         self.optimizer.step()
-#
-#         if torch.is_tensor(penalty):
-#             penalty = penalty.item()
-#
-#         return {'loss': objective.item(), 'penalty': penalty}
 
 class AbstractMMD(ERM):
     """
     Perform ERM while matching the pair-wise domain feature distributions
     using MMD (abstract class)
     """
+
     def __init__(self, input_shape, num_classes, num_domains, hparams, gaussian):
         super(AbstractMMD, self).__init__(input_shape, num_classes, num_domains,
-                                  hparams)
+                                          hparams)
         if gaussian:
             self.kernel_type = "gaussian"
         else:
@@ -1366,9 +1130,9 @@ class AbstractMMD(ERM):
         penalty = 0
         nmb = len(minibatches)
 
-        features = [self.featurizer(xi) for xi, _, _ in minibatches]
+        features = [self.featurizer(xi) for xi, _ in minibatches]
         classifs = [self.classifier(fi) for fi in features]
-        targets = [yi for _, yi, _ in minibatches]
+        targets = [yi for _, yi in minibatches]
 
         for i in range(nmb):
             objective += F.cross_entropy(classifs[i], targets[i])
@@ -1380,13 +1144,14 @@ class AbstractMMD(ERM):
             penalty /= (nmb * (nmb - 1) / 2)
 
         self.optimizer.zero_grad()
-        (objective + (self.hparams['mmd_gamma']*penalty)).backward()
+        (objective + (self.hparams['mmd_gamma'] * penalty)).backward()
         self.optimizer.step()
 
         if torch.is_tensor(penalty):
             penalty = penalty.item()
 
         return {'loss': objective.item(), 'penalty': penalty}
+
 
 class MMD(AbstractMMD):
     """

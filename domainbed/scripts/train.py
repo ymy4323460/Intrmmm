@@ -44,12 +44,11 @@ if __name__ == "__main__":
     parser.add_argument('--test_envs', type=int, nargs='+', default=[0])
     parser.add_argument('--output_dir', type=str, default="train_output")
     parser.add_argument('--holdout_fraction', type=float, default=0.2)
-    parser.add_argument('--uda_holdout_fraction', type=float, default=0.2,
+    parser.add_argument('--uda_holdout_fraction', type=float, default=0,
         help="For domain adaptation, % of test to use unlabeled for training.")
     parser.add_argument('--skip_model_save', action='store_true')
     parser.add_argument('--save_model_every_checkpoint', action='store_true')
     parser.add_argument('--gpu_id', type=int, default=0)
-    parser.add_argument('--hyper_bias', type=float, default=1.)
     args = parser.parse_args()
 
     # If we ever want to implement checkpointing, just persist these values
@@ -81,8 +80,6 @@ if __name__ == "__main__":
             misc.seed_hash(args.hparams_seed, args.trial_seed))
     if args.hparams:
         hparams.update(json.loads(args.hparams))
-
-#     hparams['bias'] = args.hyper_bias
 
     print('HParams:')
     for k, v in sorted(hparams.items()):
@@ -129,11 +126,9 @@ if __name__ == "__main__":
             misc.seed_hash(args.trial_seed, env_i), env_i)
 
         if env_i in args.test_envs:
-            uda, in_ = misc.split_dataset(out,
-                int(len(out)*args.uda_holdout_fraction),
-                misc.seed_hash(args.trial_seed, env_i))
-
-
+            uda, in_ = misc.split_dataset(in_,
+                int(len(in_)*args.uda_holdout_fraction),
+                misc.seed_hash(args.trial_seed, env_i), env_i)
 
         if hparams['class_balanced']:
             in_weights = misc.make_weights_for_balanced_classes(in_)
@@ -144,10 +139,8 @@ if __name__ == "__main__":
             in_weights, out_weights, uda_weights = None, None, None
         in_splits.append((in_, in_weights))
         out_splits.append((out, out_weights))
-
-        if len(uda)>0:
+        if len(uda):
             uda_splits.append((uda, uda_weights))
-
 
     if args.task == "domain_adaptation" and len(uda_splits) == 0:
         raise ValueError("Not enough unlabeled samples for domain adaptation.")
@@ -160,13 +153,13 @@ if __name__ == "__main__":
         for i, (env, env_weights) in enumerate(in_splits)
         if i not in args.test_envs]
 
-
     uda_loaders = [InfiniteDataLoader(
         dataset=env,
         weights=env_weights,
         batch_size=hparams['batch_size'],
         num_workers=dataset.N_WORKERS)
-        for i, (env, env_weights) in enumerate(uda_splits)]
+        for i, (env, env_weights) in enumerate(uda_splits)
+        if i in args.test_envs]
 
     eval_loaders = [FastDataLoader(
         dataset=env,
