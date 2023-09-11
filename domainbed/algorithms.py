@@ -232,22 +232,24 @@ class InterIRM(ERM):
         device = "cuda" if minibatches[0][0].is_cuda else "cpu"
         penalty_weight = (self.hparams['irm_lambda'] if self.update_count
                           >= self.hparams['irm_penalty_anneal_iters'] else
-                          1.0)
+                          0)
         nll = 0.
         penalty = 0.
-        for i in self.network.parameters():
-            i.requires_grad = True
+#         for i in self.network.parameters():
+#             i.requires_grad = True
 
-        self.min_optimizer = torch.optim.Adam(
-                filter(lambda p: p.requires_grad, self.network.parameters()),
-                lr=self.hparams["lr"],
-                weight_decay=self.hparams['weight_decay'])
+#         self.min_optimizer = torch.optim.Adam(
+#                 filter(lambda p: p.requires_grad, self.network.parameters()),
+#                 lr=self.hparams["lr"],
+#                 weight_decay=self.hparams['weight_decay'])
 
         for i, (x, y, env_i) in enumerate(minibatches):
 
             self.min_optimizer.zero_grad()
             loss, penalty = self.all_loss(x, y, env_i, 'min')
-            L = loss.mean() + penalty_weight/x.size()[0] * penalty
+
+            L = loss.mean() + penalty_weight * (penalty/x.size()[0])
+#             print(loss.mean(), penalty_weight * (penalty/x.size()[0]))
             L.backward()
             self.min_optimizer.step()
 

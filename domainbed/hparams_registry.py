@@ -75,9 +75,9 @@ def _hparams(algorithm, dataset, random_seed):
         _hparam('mlp_dropout', 0., lambda r: r.choice([0.]))
 
     elif algorithm == "InterIRM":
-        _hparam('irm_lambda', 1e2, lambda r: 10**r.uniform(-1, 5))
-        _hparam('irm_penalty_anneal_iters', 500,
-                lambda r: int(10**r.uniform(0, 4)))
+        _hparam('irm_lambda', 0.001, lambda r: r.choice([0.001, 0.00001]))
+        _hparam('irm_penalty_anneal_iters', 1000,
+                lambda r: int(r.choice([1000])))
         _hparam('prior_type', 'conditional',lambda r:'conditional')
         _hparam('int_lambda', 0.001, lambda r: r.choice([0.01, 0.001]))
         _hparam('int_reg', 0.01, lambda r: r.choice([0.1, 0.01]))
